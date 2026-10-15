@@ -22,7 +22,7 @@ MARGIN = 28
 PANEL_W = 365
 TOP_H = 100
 WIDTH = MARGIN * 2 + 9 * CELL + PANEL_W
-HEIGHT = TOP_H + MARGIN * 2 + 7 * CELL + 35
+HEIGHT = TOP_H + MARGIN * 2 + 7 * CELL + 110
 FPS = 60
 STEP_INTERVAL = 0.55
 
@@ -41,8 +41,6 @@ BLUE = (89, 162, 240)
 
 class SignalGame:
     def __init__(self, config_path: Path = DEFAULT_CONFIG):
-        self.config_path = Path(config_path)
-        self.cfg = json.loads(self.config_path.read_text(encoding="utf-8-sig"))
         self.config_path = Path(config_path).resolve()
         self.reset()
         pygame.init()
@@ -54,6 +52,7 @@ class SignalGame:
         self.title_font = pygame.font.SysFont("segoeui", 31, bold=True)
         self.button_font = pygame.font.SysFont("segoeui", 17, bold=True)
         self.buttons = self._make_buttons()
+        self.coordinate_fields = self._make_coordinate_fields()
         self.accumulator = 0.0
         self.running = True
 
@@ -62,8 +61,13 @@ class SignalGame:
         self.cfg = json.loads(self.config_path.read_text(encoding="utf-8-sig"))
         configured_eve = tuple(self.cfg["signal"]["eve_location"])
         print(f"[DEBUG] Loaded EVE coordinates from {self.config_path}: {configured_eve}")
+        # Blank inputs keep the configured target hidden until the agent discovers it.
+        self.eve_x_text = ""
+        self.eve_y_text = ""
+        self.config_error = ""
+        self.active_coordinate = None
         self.world = World(self.cfg)
-        self.agent = Agent(self.cfg)
+        self.agent = Agent(self.world.agent_config())
         self.initial_obs = {
             "position": list(self.world.pos), "battery": self.world.battery,
             "time": self.world.time, "tick": 0,
@@ -79,15 +83,24 @@ class SignalGame:
         self.latest_signal = None
         self.last_clue = None
         self.eve_found = False
+        self.show_heatmap = getattr(self, "show_heatmap", False)
         self.accumulator = 0.0
 
     def _make_buttons(self):
-        y = HEIGHT - 73
+        y = HEIGHT - 145
         x = MARGIN
         return {
             "start": pygame.Rect(x, y, 145, 45),
             "pause": pygame.Rect(x + 160, y, 190, 45),
             "restart": pygame.Rect(x + 365, y, 150, 45),
+            "apply": pygame.Rect(x + 730, y, 165, 45),
+        }
+
+    def _make_coordinate_fields(self):
+        y = HEIGHT - 145
+        return {
+            "x": pygame.Rect(MARGIN + 558, y, 50, 45),
+            "y": pygame.Rect(MARGIN + 657, y, 50, 45),
         }
 
     def _button_text(self, key):
@@ -98,7 +111,21 @@ class SignalGame:
         return "Restart"
 
     def handle_click(self, point):
+        for name, rect in self.coordinate_fields.items():
+            if rect.collidepoint(point):
+                self.active_coordinate = name
+                if name == "x":
+                    self.eve_x_text = ""
+                else:
+                    self.eve_y_text = ""
+                return
+        self.active_coordinate = None
+        if self.buttons["apply"].collidepoint(point):
+            self.apply_eve_coordinates()
+            return
         for key, rect in self.buttons.items():
+            if key == "apply":
+                continue
             if rect.collidepoint(point):
                 if key == "start" and not self.started and self.terminal is None:
                     self.started = True
@@ -109,6 +136,38 @@ class SignalGame:
                     self.reset()
                 return
 
+    def apply_eve_coordinates(self):
+        """Validate, persist, and immediately start a fresh mission at the chosen cell."""
+        try:
+            x, y = int(self.eve_x_text), int(self.eve_y_text)
+        except ValueError:
+            self.config_error = "Enter whole-number X and Y coordinates."
+            return False
+        if not (0 <= x < self.cfg["width"] and 0 <= y < self.cfg["height"]):
+            self.config_error = f"Coordinates must be inside the {self.cfg['width']} by {self.cfg['height']} grid."
+            return False
+        if (x, y) in {tuple(p) for p in self.cfg["terrain"]["obstacles"]}:
+            self.config_error = "EVE cannot be placed on an obstacle."
+            return False
+
+        updated = dict(self.cfg)
+        updated_signal = dict(self.cfg["signal"])
+        updated_signal["eve_location"] = [x, y]
+        updated["signal"] = updated_signal
+        updated["clues"] = [dict(clue) for clue in self.cfg["clues"]]
+        for clue in updated["clues"]:
+            if clue.get("type") == "confirmation":
+                clue["at"] = [x, y]
+        try:
+            self.config_path.write_text(json.dumps(updated, indent=2) + "\n", encoding="utf-8")
+        except OSError as exc:
+            self.config_error = f"Could not save mission.json: {exc}"
+            return False
+
+        self.reset()
+        self.started = True
+        return True
+
     def do_action(self):
         if self.terminal is not None:
             return
@@ -118,15 +177,12 @@ class SignalGame:
             return
         action = self.agent.choose(self.current_obs)
         if action is None:
-            self.finish(self.eve_found, "Agent ended its plan.")
+            self.finish(self.eve_found, self.agent.failure_reason or "Agent ended its plan.")
             return
         obs = self.world.observe(action)
-        decision_text = reason(action, self.agent, obs)
+        decision_text = self.agent.last_decision_reason or reason(action, self.agent, obs)
         if obs.get("clue"):
-            decision_text = f"Clue discovered: {obs['clue']['text']}"
-        if action["type"] == "analyze":
-            # The legacy runner marks every analyzed location inspected to avoid repeat analysis.
-            self.agent.inspected.add(tuple(self.agent.pos))
+            decision_text += f" Clue discovered: {obs['clue']['text']}"
         entry = {
             "step": len(self.trace) + 1,
             "action": action,
@@ -161,10 +217,11 @@ class SignalGame:
         report = {
             "mission": "WALL-E and EVE's Signal",
             "outcome": "EVE located" if success else "signal search incomplete",
+            "failure_reason": None if success else message,
             "evidence_found": self.agent.found,
             "inferred_location": {
                 "coordinates": list(self.world.eve) if success else list(best),
-                "confidence": 0.995 if success else round(self.agent.belief[best], 3),
+                "confidence": round(self.agent.belief[best], 3),
             },
             "inferred_status": (
                 self.cfg["signal"]["eve_status"] if success else
@@ -191,10 +248,26 @@ class SignalGame:
                 elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
                     self.handle_click(event.pos)
                 elif event.type == pygame.KEYDOWN:
-                    if event.key == pygame.K_SPACE and self.started and self.terminal is None:
+                    if self.active_coordinate and event.key == pygame.K_BACKSPACE:
+                        value = self.eve_x_text if self.active_coordinate == "x" else self.eve_y_text
+                        value = value[:-1]
+                        if self.active_coordinate == "x":
+                            self.eve_x_text = value
+                        else:
+                            self.eve_y_text = value
+                    elif self.active_coordinate and event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                        self.apply_eve_coordinates()
+                    elif self.active_coordinate and event.unicode.isdigit():
+                        if self.active_coordinate == "x":
+                            self.eve_x_text += event.unicode
+                        else:
+                            self.eve_y_text += event.unicode
+                    elif event.key == pygame.K_SPACE and self.started and self.terminal is None:
                         self.paused = not self.paused
                     elif event.key == pygame.K_r:
                         self.reset()
+                    elif event.key == pygame.K_h:
+                        self.show_heatmap = not self.show_heatmap
             if self.started and not self.paused and self.terminal is None:
                 self.accumulator += dt
                 if self.accumulator >= STEP_INTERVAL:
@@ -231,6 +304,16 @@ class SignalGame:
                 if self.eve_found and p == self.world.eve:
                     pygame.draw.circle(self.screen, GREEN, rect.center, 20)
                     self._center_text("E", rect.centerx, rect.centery, self.button_font, BG)
+        if self.show_heatmap:
+            peak = max(self.agent.belief.values(), default=0.0)
+            if peak > 0:
+                for point, probability in self.agent.belief.items():
+                    if probability <= 0 or point in self.world.obstacles:
+                        continue
+                    intensity = min(155, int(155 * probability / peak))
+                    overlay = pygame.Surface((CELL - 8, CELL - 8), pygame.SRCALPHA)
+                    overlay.fill((246, 75, 70, intensity))
+                    self.screen.blit(overlay, (grid_x + point[0] * CELL + 4, grid_y + point[1] * CELL + 4))
         # Draw only the explored route and live robot; hidden target and clues remain invisible.
         points = [self._cell_center(p, grid_x, grid_y) for p in self.path]
         if len(points) > 1:
@@ -242,44 +325,66 @@ class SignalGame:
         if self.terminal:
             self.draw_end_overlay()
         self.draw_buttons()
+        self.draw_coordinate_controls()
 
     def _cell_center(self, p, gx, gy):
         return gx + p[0] * CELL + CELL // 2, gy + p[1] * CELL + CELL // 2
 
     def draw_panel(self, x, y):
-        rect = pygame.Rect(x, y, PANEL_W - 25, 7 * CELL)
+        rect = pygame.Rect(x, y, PANEL_W - 25, HEIGHT - y - 166)
         pygame.draw.rect(self.screen, PANEL, rect, border_radius=12)
         tx, ty = x + 20, y + 18
         self._text("MISSION STATUS", tx, ty, self.button_font, TEAL); ty += 40
+        target = self.agent.current_target or self.agent.estimated_target
         rows = [
-            ("Battery", f"{self.world.battery} / {self.cfg['resources']['battery']}"),
-            ("Time remaining", str(self.world.time)),
-            ("Actions", str(len(self.trace))),
-            ("Position", f"{self.world.pos[0]}, {self.world.pos[1]}"),
-            ("Signal", "not scanned" if self.latest_signal is None else f"{self.latest_signal:.3f}"),
+            ("Battery / time / actions", f"{self.world.battery} / {self.world.time} / {len(self.trace)}"),
+            ("Position / signal", f"{self.world.pos} / {'—' if self.latest_signal is None else f'{self.latest_signal:.3f}'}"),
+            ("Estimate / confidence", f"{target} / {self.agent.confidence:.1%}"),
+            ("Belief entropy", f"{self.agent.entropy:.2f} bits"),
+            ("Last action", "idle" if not self.latest_action else self.latest_action["type"] + (f" {self.latest_action['direction']}" if "direction" in self.latest_action else "")),
             ("Strategy", self.agent.strategy),
         ]
         for label, value in rows:
-            self._text(label, tx, ty, self.small, MUTED); ty += 20
-            ty = self._wrapped(value, tx, ty, PANEL_W - 70, self.font, TEXT) + 8
+            self._text(label, tx, ty, self.small, MUTED)
+            ty = self._wrapped(value, tx + 124, ty, PANEL_W - 194, self.small, TEXT) + 6
         self._text("LATEST DECISION", tx, ty + 2, self.button_font, YELLOW); ty += 30
         ty = self._wrapped(self.latest_reason, tx, ty, PANEL_W - 70, self.small, TEXT) + 12
         self._text("DISCOVERED CLUES", tx, ty, self.button_font, YELLOW); ty += 26
         if not self.agent.found:
             self._text("None yet", tx, ty, self.small, MUTED)
         else:
-            for clue in self.agent.found[-3:]:
-                text = f"({clue['position'][0]}, {clue['position'][1]}) {clue['type']}: {clue['text']}"
+            for clue in self.agent.found[-2:]:
+                detail = clue["text"]
+                if len(detail) > 66:
+                    detail = detail[:63].rstrip() + "..."
+                text = f"({clue['position'][0]}, {clue['position'][1]}) {clue['type']}: {detail}"
                 ty = self._wrapped(text, tx, ty, PANEL_W - 70, self.small, TEXT) + 5
+        self._text(f"Heatmap: {'ON' if self.show_heatmap else 'OFF'} (H)", tx, rect.bottom - 27, self.small, TEAL)
 
     def draw_buttons(self):
         for key, rect in self.buttons.items():
+            if key == "apply":
+                continue
             enabled = not (key == "start" and self.started)
             color = (45, 117, 102) if key == "start" and enabled else (54, 86, 119) if key == "pause" else (78, 83, 94)
             if not enabled:
                 color = (46, 61, 74)
             pygame.draw.rect(self.screen, color, rect, border_radius=9)
             self._center_text(self._button_text(key), rect.centerx, rect.centery, self.button_font, TEXT if enabled else MUTED)
+
+    def draw_coordinate_controls(self):
+        for name, rect in self.coordinate_fields.items():
+            self._text(f"EVE {name.upper()}", rect.left - 40, rect.top + 14, self.small, MUTED)
+            pygame.draw.rect(self.screen, (40, 52, 68), rect, border_radius=7)
+            active = self.active_coordinate == name
+            pygame.draw.rect(self.screen, TEAL if active else GRID, rect, 2, border_radius=7)
+            value = self.eve_x_text if name == "x" else self.eve_y_text
+            self._center_text(value or "?", rect.centerx, rect.centery, self.font, TEXT if value else MUTED)
+        apply_rect = self.buttons["apply"]
+        pygame.draw.rect(self.screen, (45, 117, 102), apply_rect, border_radius=9)
+        self._center_text("Apply & Restart", apply_rect.centerx, apply_rect.centery, self.small, TEXT)
+        if self.config_error:
+            self._text(self.config_error, MARGIN + 545, apply_rect.bottom + 7, self.small, RED)
 
     def draw_end_overlay(self):
         overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
